@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D工牌</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
+            overflow: hidden;
+            background: transparent;
+        }
+        #canvas-container {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        #hint {
+            position: absolute;
+            bottom: 12px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: rgba(0,0,0,0.35);
+            font-size: 12px;
+            letter-spacing: 2px;
+            text-align: center;
+            z-index: 10;
+            pointer-events: none;
+        }
+        .loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #64748b;
+            font-size: 13px;
+            letter-spacing: 3px;
+            z-index: 20;
+        }
+        .upload-btn {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            z-index: 30;
+            padding: 8px 16px;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid rgba(22,93,255,0.2);
+            border-radius: 8px;
+            color: #165DFF;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            letter-spacing: 1px;
+            backdrop-filter: blur(10px);
+        }
+        .upload-btn:hover {
+            background: #ffffff;
+            border-color: #165DFF;
+            box-shadow: 0 2px 12px rgba(22,93,255,0.15);
+        }
+        #fileInput {
+            display: none;
+        }
+        .upload-btn:active {
+            transform: scale(0.98);
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container">
+        <div class="loader" id="loader">加载中...</div>
+    </div>
+    <button class="upload-btn" id="uploadBtn">更换照片</button>
+    <input type="file" id="fileInput" accept="image/*">
+    <div id="hint"></div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        const container = document.getElementById('canvas-container');
+        const loaderEl = document.getElementById('loader');
+
+        let scene, camera, renderer;
+        let badgeMesh, ropeMesh;
+        let raycaster, mouse;
+        let particles = [];
+        let particlePrevPositions = [];
+        let particleConstraints = [];
+        const numParticles = 12;
+        const restLength = 0.32;
+        const gravity = new THREE.Vector3(0, -0.0003, 0);
+        const damping = 0.995;
+        const constraintIterations = 25;
+        const springForce = 0.004;
+        
+        const boundaryX = 15.0;
+        const boundaryY = 10.0;
+        const minBoundaryY = -8.0;
+        const anchorOffsetY = 7.0;
+        const anchorOffsetX = 3.0;
+        const badgeWidth = 3.8;
+        const badgeHeight = 5.6;
+        
+        let isDragging = false;
+        let draggedParticleIndex = -1;
+        let dragPlane;
+        let badgePivot = new THREE.Vector3(0, 0, 0);
+        let badgeVelocity = new THREE.Vector3(0, 0, 0);
+        let badgeAngularVelocity = new THREE.Vector3(0, 0, 0);
+        
+        let frontMaterial, backMaterial, sidesMaterial;
+        let isLoaded = false;
+
+        function init() {
+            scene = new THREE.Scene();
+
+            const aspect = container.clientWidth / container.clientHeight;
+            camera = new THREE.PerspectiveCamera(100, aspect, 0.1, 100);
+            camera.position.set(3.0, 0.5, 5.0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.shadowMap.enabled = true;
+            renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+            container.appendChild(renderer.domElement);
+
+            raycaster = new THREE.Raycaster();
+            mouse = new THREE.Vector2();
+            dragPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+
+            createLights();
+            createBadge();
+            createRope();
+            loadFrontTexture();
+
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('mousedown', onMouseDown);
+            window.addEventListener('mousemove', onMouseMove);
+            window.addEventListener('mouseup', onMouseUp);
+            window.addEventListener('mouseleave', onMouseUp);
+            window.addEventListener('touchstart', onTouchStart);
+            window.addEventListener('touchmove', onTouchMove);
+            window.addEventListener('touchend', onTouchEnd);
+
+            animate();
+        }
+
+        function createLights() {
+            const ambientLight = new THREE.AmbientLight(0xf0f9ff, 0.9);
+            scene.add(ambientLight);
+
+            const mainLight = new THREE.DirectionalLight(0xffffff, 0.5);
+            mainLight.position.set(3, 4, 4);
+            mainLight.castShadow = true;
+            mainLight.shadow.mapSize.width = 1024;
+            mainLight.shadow.mapSize.height = 1024;
+            mainLight.shadow.bias = -0.0005;
+            mainLight.shadow.opacity = 0.12;
+            mainLight.shadow.radius = 10;
+            scene.add(mainLight);
+
+            const fillLight = new THREE.DirectionalLight(0xe0f2fe, 0.35);
+            fillLight.position.set(-3, 2, -3);
+            scene.add(fillLight);
+
+            const rimLight = new THREE.DirectionalLight(0xffffff, 0.15);
+            rimLight.position.set(0, -2, 3);
+            scene.add(rimLight);
+        }
+
+        function createBadge() {
+            const radius = 0.12;
+            const thickness = 0.06;
+            const bevelThickness = 0.01;
+            const bevelSize = 0.02;
+
+            const shape = new THREE.Shape();
+            shape.moveTo(radius, 0);
+            shape.lineTo(badgeWidth - radius, 0);
+            shape.quadraticCurveTo(badgeWidth, 0, badgeWidth, radius);
+            shape.lineTo(badgeWidth, badgeHeight - radius);
+            shape.quadraticCurveTo(badgeWidth, badgeHeight, badgeWidth - radius, badgeHeight);
+            shape.lineTo(radius, badgeHeight);
+            shape.quadraticCurveTo(0, badgeHeight, 0, badgeHeight - radius);
+            shape.lineTo(0, radius);
+            shape.quadraticCurveTo(0, 0, radius, 0);
+            shape.closePath();
+
+            const extrudeSettings = {
+                depth: thickness,
+                bevelEnabled: true,
+                bevelThickness: bevelThickness,
+                bevelSize: bevelSize,
+                bevelOffset: 0,
+                bevelSegments: 4
+            };
+
+            const geometry = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+            geometry.center();
+
+            // 手动修复UV映射，确保纹理正确显示在正面
+            geometry.computeBoundingBox();
+            const bbox = geometry.boundingBox;
+            const actualWidth = bbox.max.x - bbox.min.x;
+            const actualHeight = bbox.max.y - bbox.min.y;
+            
+            const uvAttribute = geometry.attributes.uv;
+            const positionAttribute = geometry.attributes.position;
+            
+            for (let i = 0; i < uvAttribute.count; i++) {
+                const x = positionAttribute.getX(i);
+                const y = positionAttribute.getY(i);
+                const z = positionAttribute.getZ(i);
+                
+                // 只修复正面（z 接近最大值的面）
+                if (z > bbox.max.z - 0.01) {
+                    // 将位置坐标映射到UV坐标（0-1范围），使用实际边界
+                    // u值翻转修复镜像，v值正常修复倒置
+                    const u = 1 - (x - bbox.min.x) / actualWidth;  // 翻转u修复镜像
+                    const v = (y - bbox.min.y) / actualHeight;     // 不翻转v
+                    uvAttribute.setXY(i, u, v);
+                }
+            }
+            uvAttribute.needsUpdate = true;
+
+            frontMaterial = new THREE.MeshStandardMaterial({
+                color: 0xffffff,
+                roughness: 0.5,
+                metalness: 0.05,
+                side: THREE.FrontSide
+            });
+
+            const backCanvas = document.createElement('canvas');
+            // 背面canvas尺寸比例需要与工牌比例一致
+            const backCanvasHeight = 512;
+            const backCanvasWidth = Math.round(backCanvasHeight * (badgeWidth / badgeHeight));
+            backCanvas.width = backCanvasWidth;
+            backCanvas.height = backCanvasHeight;
+            const backCtx = backCanvas.getContext('2d');
+            backCtx.fillStyle = '#f8fafc';
+            backCtx.fillRect(0, 0, backCanvasWidth, backCanvasHeight);
+            backCtx.strokeStyle = '#cbd5e1';
+            backCtx.lineWidth = 2;
+            backCtx.strokeRect(20, 20, backCanvasWidth-40, backCanvasHeight-40);
+
+            const cx = backCanvasWidth/2, cy = backCanvasHeight/2;
+            const radius1 = 40, radius2 = 100;
+            backCtx.beginPath();
+            backCtx.arc(cx, cy, radius1, 0, Math.PI * 2);
+            backCtx.strokeStyle = '#334155';
+            backCtx.lineWidth = 4;
+            backCtx.stroke();
+
+            for (let i = 0; i < 6; i++) {
+                const angle = (i / 6) * Math.PI * 2;
+                const x1 = cx + Math.cos(angle) * (radius1 + 10);
+                const y1 = cy + Math.sin(angle) * (radius1 + 10);
+                const x2 = cx + Math.cos(angle) * radius2;
+                const y2 = cy + Math.sin(angle) * radius2;
+                backCtx.beginPath();
+                backCtx.moveTo(x1, y1);
+                backCtx.lineTo(x2, y2);
+                backCtx.strokeStyle = '#334155';
+                backCtx.lineWidth = 3;
+                backCtx.stroke();
+
+                const endRadius = 8;
+                backCtx.beginPath();
+                backCtx.arc(x2, y2, endRadius, 0, Math.PI * 2);
+                backCtx.fillStyle = '#334155';
+                backCtx.fill();
+            }
+
+            const backTexture = new THREE.CanvasTexture(backCanvas);
+            backTexture.colorSpace = THREE.SRGBColorSpace;
+
+            backMaterial = new THREE.MeshStandardMaterial({
+                map: backTexture,
+                roughness: 0.4,
+                metalness: 0.1,
+                side: THREE.BackSide
+            });
+
+            sidesMaterial = new THREE.MeshStandardMaterial({
+                color: 0x94a3b8,
+                roughness: 0.3,
+                metalness: 0.2
+            });
+
+            badgeMesh = new THREE.Mesh(geometry, [frontMaterial, backMaterial, sidesMaterial]);
+            badgeMesh.castShadow = true;
+            badgeMesh.receiveShadow = true;
+            scene.add(badgeMesh);
+
+            const clipGeometry = new THREE.TorusGeometry(0.2, 0.02, 16, 32);
+            const clipMaterial = new THREE.MeshStandardMaterial({
+                color: 0x1e293b,
+                roughness: 0.5,
+                metalness: 0.3
+            });
+            const clip = new THREE.Mesh(clipGeometry, clipMaterial);
+            clip.position.y = badgeHeight / 2 - 0.02;
+            clip.rotation.x = Math.PI / 2;
+            clip.castShadow = true;
+            badgeMesh.add(clip);
+
+            const clipPinGeometry = new THREE.CylinderGeometry(0.012, 0.012, 0.06, 12);
+            const clipPinMaterial = new THREE.MeshStandardMaterial({
+                color: 0x64748b,
+                roughness: 0.4,
+                metalness: 0.5
+            });
+            const clipPin = new THREE.Mesh(clipPinGeometry, clipPinMaterial);
+            clipPin.position.y = badgeHeight / 2 - 0.02;
+            clipPin.position.x = 0;
+            clipPin.castShadow = true;
+            badgeMesh.add(clipPin);
+        }
+
+        function createRope() {
+            const totalLength = numParticles * restLength;
+            const startY = anchorOffsetY;
+            
+            for (let i = 0; i < numParticles; i++) {
+                const y = startY - i * restLength;
+                particles.push(new THREE.Vector3(anchorOffsetX, y, 0));
+                particlePrevPositions.push(new THREE.Vector3(anchorOffsetX, y, 0));
+            }
+
+            for (let i = 0; i < numParticles - 1; i++) {
+                particleConstraints.push({
+                    index1: i,
+                    index2: i + 1,
+                    length: restLength
+                });
+            }
+
+            updateRopeMesh();
+        }
+
+        let ropeCurve;
+        let ropePositions;
+        
+        function updateRopeMesh() {
+            if (!ropeCurve) {
+                ropeCurve = new THREE.CatmullRomCurve3(particles, false, 'catmullrom', 0.5);
+            } else {
+                ropeCurve.points = particles;
+            }
+            
+            if (!ropeMesh) {
+                const tubeGeometry = new THREE.TubeGeometry(ropeCurve, numParticles * 4, 0.022, 8, false);
+                const ropeMaterial = new THREE.MeshStandardMaterial({
+                    color: 0x334155,
+                    roughness: 0.85,
+                    metalness: 0.05,
+                    side: THREE.DoubleSide
+                });
+                ropeMesh = new THREE.Mesh(tubeGeometry, ropeMaterial);
+                ropeMesh.castShadow = true;
+                scene.add(ropeMesh);
+                ropePositions = tubeGeometry.attributes.position;
+            } else {
+                const newGeometry = new THREE.TubeGeometry(ropeCurve, numParticles * 4, 0.022, 8, false);
+                ropePositions.array.set(newGeometry.attributes.position.array);
+                ropePositions.needsUpdate = true;
+                ropeMesh.geometry.computeBoundingSphere();
+                newGeometry.dispose();
+            }
+        }
+
+        function loadFrontTexture() {
+            const img = new Image();
+            img.crossOrigin = 'anonymous';
+            img.onload = function() {
+                const canvas = document.createElement('canvas');
+                const canvasHeight = 800;
+                const canvasWidth = Math.round(canvasHeight * (badgeWidth / badgeHeight));
+                canvas.width = canvasWidth;
+                canvas.height = canvasHeight;
+                const ctx = canvas.getContext('2d');
+                
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+                
+                const imgRatio = img.width / img.height;
+                const targetRatio = canvasWidth / canvasHeight;
+                let drawWidth, drawHeight, offsetX, offsetY;
+                
+                if (imgRatio > targetRatio) {
+                    drawHeight = canvasHeight;
+                    drawWidth = img.width * (canvasHeight / img.height);
+                    offsetX = (canvasWidth - drawWidth) / 2;
+                    offsetY = 0;
+                } else {
+                    drawWidth = canvasWidth;
+                    drawHeight = img.height * (canvasWidth / img.width);
+                    offsetX = 0;
+                    offsetY = (canvasHeight - drawHeight) / 2;
+                }
+                
+                ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
+                
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+                ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+                
+                const texture = new THREE.CanvasTexture(canvas);
+                texture.colorSpace = THREE.SRGBColorSpace;
+                texture.flipY = true;
+                frontMaterial.map = texture;
+                frontMaterial.needsUpdate = true;
+                
+                console.log('工牌.jpg loaded successfully');
+                finishLoading();
+            };
+            img.onerror = function(err) {
+                console.error('Failed to load 工牌.jpg:', err);
+                createDefaultFrontTexture();
+                finishLoading();
+            };
+            img.src = 'badge.jpg';
+        }
+
+        function createDefaultFrontTexture() {
+            const canvas = document.createElement('canvas');
+            // canvas尺寸比例需要与工牌比例一致
+            const canvasHeight = 800;
+            const canvasWidth = Math.round(canvasHeight * (badgeWidth / badgeHeight));
+            canvas.width = canvasWidth;
+            canvas.height = canvasHeight;
+            const ctx = canvas.getContext('2d');
+            
+            ctx.fillStyle = '#f8fafc';
+            ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+            
+            ctx.fillStyle = '#1e293b';
+            ctx.font = 'bold 56px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('张萌', canvasWidth/2, 180);
+            
+            ctx.fillStyle = '#475569';
+            ctx.font = '30px sans-serif';
+            ctx.fillText('广东轻工职业技术大学', canvasWidth/2, 260);
+            
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '26px sans-serif';
+            ctx.fillText('数字媒体技术', canvasWidth/2, 320);
+            
+            ctx.strokeStyle = '#e2e8f0';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(30, 30, canvasWidth-60, canvasHeight-60);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.flipY = true;
+            frontMaterial.map = texture;
+            frontMaterial.needsUpdate = true;
+        }
+
+        function finishLoading() {
+            isLoaded = true;
+            loaderEl.style.display = 'none';
+            updateBadgePosition();
+            setupUploadHandlers();
+        }
+
+        function setupUploadHandlers() {
+            const uploadBtn = document.getElementById('uploadBtn');
+            const fileInput = document.getElementById('fileInput');
+            const canvasContainer = document.getElementById('canvas-container');
+
+            uploadBtn.addEventListener('click', function() {
+                fileInput.click();
+            });
+
+            fileInput.addEventListener('change', function(e) {
+                if (e.target.files && e.target.files[0]) {
+                    handleImageFile(e.target.files[0]);
+                }
+            });
+
+            canvasContainer.addEventListener('dragover', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+
+            canvasContainer.addEventListener('drop', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                    const file = e.dataTransfer.files[0];
+                    if (file.type.startsWith('image/')) {
+                        handleImageFile(file);
+                    }
+                }
+            });
+        }
+
+        function handleImageFile(file) {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const img = new Image();
+                img.onload = function() {
+                    applyImageToBadge(img);
+                };
+                img.onerror = function() {
+                    console.error('Failed to load image');
+                };
+                img.src = e.target.result;
+            };
+            reader.onerror = function() {
+                console.error('Failed to read file');
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function applyImageToBadge(img) {
+            const canvas = document.createElement('canvas');
+            // canvas尺寸比例需要与工牌比例一致：badgeWidth/badgeHeight = 3.8/5.6
+            const targetHeight = 800;
+            const targetWidth = Math.round(targetHeight * (badgeWidth / badgeHeight));
+            canvas.width = targetWidth;
+            canvas.height = targetHeight;
+            const ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, targetWidth, targetHeight);
+
+            const imgRatio = img.width / img.height;
+            const targetRatio = targetWidth / targetHeight;
+            let drawWidth, drawHeight, offsetX, offsetY;
+
+            if (imgRatio > targetRatio) {
+                drawHeight = targetHeight;
+                drawWidth = img.width * (targetHeight / img.height);
+                offsetX = (targetWidth - drawWidth) / 2;
+                offsetY = 0;
+            } else {
+                drawWidth = targetWidth;
+                drawHeight = img.height * (targetWidth / img.width);
+                offsetX = 0;
+                offsetY = (targetHeight - drawHeight) / 2;
+            }
+
+            ctx.drawImage(img, offsetX, offsetY, drawWidth, drawHeight);
+
+            // 适当降低亮度，添加半透明黑色遮罩（约15%暗度）
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.15)';
+            ctx.fillRect(0, 0, targetWidth, targetHeight);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+            texture.flipY = true;
+
+            if (frontMaterial) {
+                frontMaterial.map = texture;
+                frontMaterial.needsUpdate = true;
+                console.log('Badge photo updated successfully');
+            }
+        }
+
+        function updateBadgePosition() {
+            if (!isLoaded || particles.length === 0) return;
+            
+            const bottomParticle = particles[particles.length - 1];
+            const badgeCenterY = bottomParticle.y - badgeHeight / 2 + 0.05;
+            
+            badgeMesh.position.x = bottomParticle.x;
+            badgeMesh.position.y = badgeCenterY;
+            badgeMesh.position.z = bottomParticle.z;
+            
+            badgePivot.copy(bottomParticle);
+        }
+
+        function updatePhysics() {
+            if (!isLoaded) return;
+
+            const bottomParticle = particles[numParticles - 1];
+
+            for (let i = 0; i < numParticles; i++) {
+                if (i === 0) {
+                    particles[i].set(anchorOffsetX, anchorOffsetY, 0);
+                    particlePrevPositions[i].copy(particles[i]);
+                    continue;
+                }
+                if (i === draggedParticleIndex && isDragging) continue;
+
+                const pos = particles[i];
+                const prevPos = particlePrevPositions[i];
+
+                const vx = (pos.x - prevPos.x) * damping;
+                const vy = (pos.y - prevPos.y) * damping;
+
+                prevPos.x = pos.x;
+                prevPos.y = pos.y;
+
+                pos.x += vx;
+                pos.y += vy + gravity.y;
+            }
+
+            for (let iter = 0; iter < constraintIterations; iter++) {
+                for (let j = 0; j < particleConstraints.length; j++) {
+                    const c = particleConstraints[j];
+                    const p1 = particles[c.index1];
+                    const p2 = particles[c.index2];
+
+                    const dx = p2.x - p1.x;
+                    const dy = p2.y - p1.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+
+                    if (dist < 0.001) continue;
+
+                    const diff = (dist - c.length) / dist;
+                    const ox = dx * diff * 0.5;
+                    const oy = dy * diff * 0.5;
+
+                    if (c.index1 !== 0) {
+                        p1.x += ox;
+                        p1.y += oy;
+                    }
+                    p2.x -= ox;
+                    p2.y -= oy;
+                }
+            }
+
+            if (!isDragging) {
+                const restY = anchorOffsetY - numParticles * restLength / 2;
+                const targetX = anchorOffsetX;
+                const targetY = restY;
+
+                bottomParticle.x += (targetX - bottomParticle.x) * springForce;
+                bottomParticle.y += (targetY - bottomParticle.y) * springForce;
+
+                bottomParticle.x = Math.max(-boundaryX, Math.min(boundaryX, bottomParticle.x));
+                bottomParticle.y = Math.max(minBoundaryY, Math.min(boundaryY, bottomParticle.y));
+
+                if (bottomParticle.y < minBoundaryY + 0.3) {
+                    bottomParticle.y += (restY - bottomParticle.y) * 0.03;
+                }
+            }
+
+            const badgeCenterY = bottomParticle.y - badgeHeight / 2 + 0.05;
+            for (let i = 1; i < numParticles - 1; i++) {
+                const p = particles[i];
+                const dx = p.x - bottomParticle.x;
+                const dy = p.y - badgeCenterY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                const badgeRadius = Math.max(badgeWidth, badgeHeight) / 2 + 0.1;
+
+                if (dist < badgeRadius && p.y < badgeCenterY + badgeHeight / 2 && p.y > badgeCenterY - badgeHeight / 2) {
+                    const angle = Math.atan2(dy, dx);
+                    p.x = bottomParticle.x + Math.cos(angle) * badgeRadius;
+                    p.y = badgeCenterY + Math.sin(angle) * badgeRadius;
+                }
+            }
+
+            updateBadgePosition();
+            updateRopeMesh();
+        }
+
+        function onWindowResize() {
+            const aspect = container.clientWidth / container.clientHeight;
+            camera.aspect = aspect;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+        }
+
+        function onMouseDown(event) {
+            if (!isLoaded) return;
+            
+            isDragging = true;
+            
+            const rect = container.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(badgeMesh);
+            
+            if (intersects.length > 0) {
+                draggedParticleIndex = numParticles - 1;
+                dragPlane.constant = -intersects[0].point.z;
+                badgeVelocity.set(0, 0, 0);
+                badgeAngularVelocity.set(0, 0, 0);
+            } else {
+                draggedParticleIndex = -1;
+            }
+        }
+
+        function onMouseMove(event) {
+            if (!isLoaded) return;
+            
+            const rect = container.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            
+            if (isDragging && draggedParticleIndex !== -1) {
+                raycaster.setFromCamera(mouse, camera);
+                const targetPoint = new THREE.Vector3();
+                raycaster.ray.intersectPlane(dragPlane, targetPoint);
+                
+                if (targetPoint) {
+                    targetPoint.x = Math.max(-boundaryX, Math.min(boundaryX, targetPoint.x));
+                    targetPoint.y = Math.max(minBoundaryY, Math.min(boundaryY, targetPoint.y));
+                    
+                    const currentPos = particles[draggedParticleIndex];
+                    const prevPos = particlePrevPositions[draggedParticleIndex];
+                    
+                    badgeVelocity.subVectors(targetPoint, currentPos);
+                    
+                    currentPos.copy(targetPoint);
+                    prevPos.copy(currentPos);
+                    prevPos.sub(badgeVelocity);
+                }
+            }
+        }
+
+        function onMouseUp() {
+            if (!isLoaded) return;
+            
+            if (isDragging && draggedParticleIndex !== -1) {
+                const currentPos = particles[draggedParticleIndex];
+                const prevPos = particlePrevPositions[draggedParticleIndex];
+                badgeVelocity.subVectors(currentPos, prevPos);
+            }
+            
+            isDragging = false;
+            draggedParticleIndex = -1;
+        }
+
+        function onTouchStart(event) {
+            if (!isLoaded || event.touches.length !== 1) return;
+            
+            isDragging = true;
+            
+            const rect = container.getBoundingClientRect();
+            mouse.x = ((event.touches[0].clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.touches[0].clientY - rect.top) / rect.height) * 2 + 1;
+            
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(badgeMesh);
+            
+            if (intersects.length > 0) {
+                draggedParticleIndex = numParticles - 1;
+                dragPlane.constant = -intersects[0].point.z;
+            } else {
+                draggedParticleIndex = -1;
+            }
+        }
+
+        function onTouchMove(event) {
+            if (!isLoaded || event.touches.length !== 1) return;
+            
+            const rect = container.getBoundingClientRect();
+            mouse.x = ((event.touches[0].clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.touches[0].clientY - rect.top) / rect.height) * 2 + 1;
+            
+            if (isDragging && draggedParticleIndex !== -1) {
+                raycaster.setFromCamera(mouse, camera);
+                const targetPoint = new THREE.Vector3();
+                raycaster.ray.intersectPlane(dragPlane, targetPoint);
+                
+                if (targetPoint) {
+                    targetPoint.x = Math.max(-boundaryX, Math.min(boundaryX, targetPoint.x));
+                    targetPoint.y = Math.max(minBoundaryY, Math.min(boundaryY, targetPoint.y));
+                    
+                    const currentPos = particles[draggedParticleIndex];
+                    const prevPos = particlePrevPositions[draggedParticleIndex];
+                    
+                    badgeVelocity.subVectors(targetPoint, currentPos);
+                    
+                    currentPos.copy(targetPoint);
+                    prevPos.copy(currentPos);
+                    prevPos.sub(badgeVelocity);
+                }
+            }
+        }
+
+        function onTouchEnd() {
+            if (!isLoaded) return;
+            
+            isDragging = false;
+            draggedParticleIndex = -1;
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            updatePhysics();
+            
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
